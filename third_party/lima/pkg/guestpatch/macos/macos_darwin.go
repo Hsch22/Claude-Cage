@@ -143,11 +143,17 @@ func writeGuestFiles(ctx context.Context, dataSliceDevice, mnt string) error {
 	const initSh = `#!/bin/sh
 set -eux
 date
-if [ ! -e /Volumes/cidata ]; then
-  echo "/Volumes/cidata is not mounted" >&2
-  exit 1
-fi
-exec /Volumes/cidata/lima-guestagent fake-cloud-init
+agent=/Volumes/cidata/lima-guestagent
+waited=0
+while [ ! -f "$agent" ] || [ ! -x "$agent" ]; do
+  if [ "$waited" -ge 30 ]; then
+    echo "Timed out after 30s waiting for executable $agent" >&2
+    exit 1
+  fi
+  sleep 1
+  waited=$((waited + 1))
+done
+exec "$agent" fake-cloud-init
 `
 	if err := os.MkdirAll(filepath.Join(mnt, "usr/local/sbin"), 0o755); err != nil {
 		return err
