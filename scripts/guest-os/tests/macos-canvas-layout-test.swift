@@ -6,38 +6,36 @@ struct MacCanvasLayoutSettlementTest {
     static func check(_ value: Bool) { precondition(value) }
     @MainActor
     static func main() async throws {
-        let wanted32 = CGSize(width: 1240, height: 872)
-        let wanted38 = CGSize(width: 1240, height: 878)
-        let at872 = CGRect(origin: .zero, size: wanted32)
-        let at878 = CGRect(origin: .zero, size: wanted38)
-        var initial = MacCanvasLayoutSettlement(requested: wanted32)
-        // The observed first layout was crop 38 on an outer height of 872:
-        // publishing that sample would expose 834 content points, not 840.
-        check(try initial.observe(bounds: at872, crop: 38, wanted: wanted38) == .resize(wanted38))
-        check(try initial.observe(bounds: at878, crop: 38, wanted: wanted38) == .wait)
-        check(try initial.observe(bounds: at878, crop: 32, wanted: wanted32) == .resize(wanted32))
-        check(try initial.observe(bounds: at872, crop: 32, wanted: wanted32) == .wait)
-        check(try initial.observe(bounds: at872, crop: 32, wanted: wanted32) == .settled)
-        precondition(at872.height - 32 == 840)
+        let plan = MacCanvasFixedCropLayout(crop: 32, content: CGSize(width: 1240, height: 840), display: CGSize(width: 1920, height: 1200))
+        let at872 = CGRect(origin: .zero, size: plan.outerSize)
+        precondition(plan.outerSize.height == 872 && plan.crop == 32)
+        var initial = MacCanvasLayoutSettlement()
+        // AX buttons temporarily report 38 after resize; they cannot feed back
+        // into bounds settlement or change the fixed crop/outer height.
+        check(try initial.observe(bounds: at872) == .wait)
+        check(try initial.observe(bounds: at872) == .settled)
+        precondition(plan.outerSize.height - plan.crop == 840)
 
-        var changing = MacCanvasLayoutSettlement(requested: wanted32)
+        var changing = MacCanvasLayoutSettlement()
         for n in 0..<12 {
-            let crop: CGFloat = n % 2 == 0 ? 38 : 32
-            let wanted = crop == 38 ? wanted38 : wanted32
-            let decision = try changing.observe(bounds: CGRect(origin: .zero, size: wanted), crop: crop, wanted: wanted)
-            precondition(decision != .settled)
+            check(try changing.observe(bounds: at872.offsetBy(dx: CGFloat(n), dy: 0)) != .settled)
         }
         do {
-            _ = try changing.observe(bounds: at872, crop: 32, wanted: wanted32)
-            fatalError("An unstable title bar must fail after the bounded observation budget")
+            _ = try changing.observe(bounds: at872)
+            fatalError("Unstable bounds must exhaust the observation budget")
         } catch MacCanvasLayoutSettlement.Problem.unstable {}
 
-        var moving = MacCanvasLayoutSettlement(requested: wanted32)
-        check(try moving.observe(bounds: at872, crop: 32, wanted: wanted32) == .wait)
+        var moving = MacCanvasLayoutSettlement()
+        check(try moving.observe(bounds: at872) == .wait)
         let moved = at872.offsetBy(dx: 10, dy: 0)
-        check(try moving.observe(bounds: moved, crop: 32, wanted: wanted32) == .wait)
-        check(try moving.observe(bounds: moved, crop: 32, wanted: wanted32) == .settled)
-        print("Layout crop correction, bounded instability, and origin settling passed")
+        check(try moving.observe(bounds: moved) == .wait)
+        check(try moving.observe(bounds: moved) == .settled)
+        // A stable minimum-size constrained window retains actual-size semantics.
+        var constrained = MacCanvasLayoutSettlement()
+        let large = CGRect(x: 0, y: 0, width: 1400, height: 1000)
+        check(try constrained.observe(bounds: large) == .wait)
+        check(try constrained.observe(bounds: large) == .settled)
+        print("Fixed crop, bounded bounds settlement, origin and constrained-size behavior passed")
         var transactions = MacCanvasLayoutTransactions()
         let oldLayout = transactions.begin()
         precondition(transactions.isCurrent(oldLayout))
@@ -71,27 +69,39 @@ struct MacCanvasLayoutSettlementTest {
         precondition(!transactions.invalidate(oldLayout))
         print("Transaction interleaving, stale completion, background validation, and zero-probe warm frames passed")
         var attempts = 0
-        var frameTransactions = MacCanvasLayoutTransactions()
-        let published: (crop: CGFloat, content: CGFloat) = try await MacCanvasFrameConvergence.run { recovery in
-            attempts += 1
-            if let recovery { precondition(frameTransactions.isCurrent(recovery.recoveryGeneration)) }
-            let generation = frameTransactions.begin()
-            let sampledCrop: CGFloat = attempts == 1 ? 38 : 32
-            // The actual title bar changes after capture on the first attempt.
-            do {
-                try frameTransactions.validateCrop(generation) { sampledCrop == 32 }
-            } catch MacCanvasLayoutTransactions.Problem.cropChanged {
-                precondition(frameTransactions.invalidate(generation))
-                throw MacCanvasCropChanged(recoveryGeneration: frameTransactions.current)
+        for actualCrops: [CGFloat] in [[32], [38, 38], [38, 32, 32]] {
+            attempts = 0
+            var frameTransactions = MacCanvasLayoutTransactions()
+            let published: (crop: CGFloat, content: CGFloat) = try await MacCanvasFrameConvergence.run { recovery in
+                if let recovery {
+                    precondition(frameTransactions.isCurrent(recovery.recoveryGeneration))
+                    precondition(recovery.matches(window: 7, pid: 23))
+                    precondition(!recovery.matches(window: 8, pid: 23) && !recovery.matches(window: 7, pid: 24))
+                }
+                let generation = frameTransactions.begin()
+                let fixed = MacCanvasFixedCropLayout(crop: recovery?.observedCrop ?? 32,
+                    content: CGSize(width: 1240, height: 840), display: CGSize(width: 1920, height: 1200))
+                var settlement = MacCanvasLayoutSettlement()
+                let bounds = CGRect(origin: .zero, size: fixed.outerSize)
+                check(try settlement.observe(bounds: bounds) == .wait)
+                check(try settlement.observe(bounds: bounds) == .settled)
+                let capturedCrop = actualCrops[attempts]
+                attempts += 1
+                do {
+                    try frameTransactions.validateCrop(generation) { fixed.crop == capturedCrop }
+                } catch MacCanvasLayoutTransactions.Problem.cropChanged {
+                    precondition(frameTransactions.invalidate(generation))
+                    throw MacCanvasCropChanged(recoveryGeneration: frameTransactions.current, window: 7, pid: 23, observedCrop: capturedCrop)
+                }
+                return (fixed.crop, bounds.height - fixed.crop)
             }
-            return (sampledCrop, CGFloat(872) - sampledCrop)
+            precondition(attempts == actualCrops.count && published.crop == actualCrops.last! && published.content == 840)
         }
-        precondition(attempts == 2 && published.crop == 32 && published.content == 840)
         attempts = 0
         do {
             let _: Int = try await MacCanvasFrameConvergence.run { _ in
                 attempts += 1
-                throw MacCanvasCropChanged(recoveryGeneration: UUID())
+                throw MacCanvasCropChanged(recoveryGeneration: UUID(), window: 7, pid: 23, observedCrop: 38)
             }
             fatalError("Repeated capture crop changes must fail")
         } catch MacCanvasFrameConvergence.Problem.unstable {}
@@ -102,7 +112,7 @@ struct MacCanvasLayoutSettlementTest {
             let _: Int = try await MacCanvasFrameConvergence.run { recovery in
                 attempts += 1
                 if recovery != nil { throw TargetFailure.changed }
-                throw MacCanvasCropChanged(recoveryGeneration: UUID())
+                throw MacCanvasCropChanged(recoveryGeneration: UUID(), window: 7, pid: 23, observedCrop: 38)
             }
             fatalError("A changed window during recovery must not be retried")
         } catch TargetFailure.changed {}

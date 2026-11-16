@@ -404,7 +404,7 @@ private func handle(_ input: Request, inputSession: MacWindowInputSession) async
                     let targetMs = (Date().timeIntervalSince(targetStarted) * 1000).rounded()
                     let layoutStarted = Date()
                     let capture = filter ?? SCContentFilter(desktopIndependentWindow: window)
-                    let layout = try await canvas.layout(window, filter:capture, width:width, height:height, scale:scale)
+                    let layout = try await canvas.layout(window, filter:capture, width:width, height:height, scale:scale, recovery:recovery)
                     // Reacquire the exact window after AX resize or repositioning.
                     var target = window, source = capture
                     if abs(window.frame.minX - layout.frame.minX) >= 1 || abs(window.frame.minY - layout.frame.minY) >= 1 ||
