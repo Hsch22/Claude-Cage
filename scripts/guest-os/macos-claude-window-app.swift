@@ -390,10 +390,11 @@ private func handle(_ input: Request, inputSession: MacWindowInputSession) async
             let layoutStarted = Date()
             let capture = filter ?? SCContentFilter(desktopIndependentWindow: window)
             let layout = try await canvas.layout(window, filter:capture, width:width, height:height, scale:scale)
-            // A window object from before AX resizing still describes the old
-            // surface. Reacquire that exact window before the first new frame.
+            // A window object from before AX resizing or repositioning still
+            // describes the old surface. Reacquire that exact window first.
             var target = window, source = capture
-            if abs(window.frame.width - layout.frame.width) >= 1 || abs(window.frame.height - layout.frame.height) >= 1 {
+            if abs(window.frame.minX - layout.frame.minX) >= 1 || abs(window.frame.minY - layout.frame.minY) >= 1 ||
+               abs(window.frame.width - layout.frame.width) >= 1 || abs(window.frame.height - layout.frame.height) >= 1 {
                 let (fresh, selection) = try await targetWindow(fresh: true)
                 guard fresh.windowID == layout.id, fresh.owningApplication?.processID == layout.pid else {
                     throw Failure(7, "window_changed")

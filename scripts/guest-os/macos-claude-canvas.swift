@@ -176,10 +176,15 @@ final class ClaudeCanvasSession {
 
     func forgetTarget() { target = nil }
 
-    // Input reuses the window the frame stream already verified. Its geometry
-    // and focus are still checked by inputGeometry before every delivery.
+    // Input reuses the window the frame stream already verified only while
+    // its captured bounds match the layout. Input checks geometry and focus
+    // again before every delivery, including the SCWindow's original bounds.
     func cachedWindow() -> SCWindow? {
         guard let cached = target, Date().timeIntervalSince(cached.time) < Self.targetLifetime,
+              abs(cached.window.frame.minX - cached.layout.frame.minX) < 1,
+              abs(cached.window.frame.minY - cached.layout.frame.minY) < 1,
+              abs(cached.window.frame.width - cached.layout.frame.width) < 1,
+              abs(cached.window.frame.height - cached.layout.frame.height) < 1,
               (try? liveBounds(cached.layout.id, cached.layout.pid)) == cached.layout.frame else { return nil }
         return cached.window
     }
