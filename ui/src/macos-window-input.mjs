@@ -10,6 +10,8 @@ export function createMacWindowInput({ element, frame, active, request, onError,
   let keyboard, disposed = false, queued, pending = 0, move, wheel, drag, lastClick;
   const keys = new Set(), listeners = [];
   const run = action => {
+    // Every distinct queued action ends the preceding wheel group.
+    wheel = undefined;
     if (disposed) return Promise.reject(new Error("窗口输入连接已关闭"));
     if (pending >= 128) return Promise.reject(new Error("窗口输入等待过多，请重新连接"));
     pending++;
@@ -108,25 +110,41 @@ export function createMacWindowInput({ element, frame, active, request, onError,
   on(element, "pointercancel", reset);
   on(element, "lostpointercapture", () => { if (drag) reset(); });
   on(element, "contextmenu", event => event.preventDefault());
-  // A trackpad emits dozens of wheel events per second, while each request
-  // waits for the guest. Merge the ones still queued into a single scroll so
-  // the page follows the gesture instead of replaying a backlog afterwards.
+  // Merge only adjacent, unsent wheel events. Every block stays within the
+  // wire limit, so overflow never has to be appended after a later input.
   const clamp = value => Math.max(-1200, Math.min(1200, value));
   const scroll = (target, at, deltaY, deltaX) => {
-    if (wheel && identity(wheel.target) === identity(target)) {
-      Object.assign(wheel, { at, deltaY: wheel.deltaY + deltaY, deltaX: wheel.deltaX + deltaX });
+    move = undefined;
+    if (!Number.isFinite(deltaY) || !Number.isFinite(deltaX)) {
+      wheel = undefined;
+      report(Promise.reject(new Error("滚动距离无效")));
       return;
     }
-    const entry = { target, at, deltaY, deltaX };
-    wheel = entry;
-    report(run(() => {
-      if (wheel === entry) wheel = undefined;
-      if (!valid(entry.target)) throw new Error("输入窗口已变化，请重新操作");
-      const delta = clamp(entry.deltaY), deltaX = clamp(entry.deltaX);
-      // A merged gesture beyond one request's limit continues in the next one.
-      if (entry.deltaY !== delta || entry.deltaX !== deltaX) scroll(entry.target, entry.at, entry.deltaY - delta, entry.deltaX - deltaX);
-      return request("scroll", { ...entry.target, ...entry.at, delta, deltaX });
-    }));
+    if (wheel && identity(wheel.target) === identity(target) && wheel.target.surface === target.surface &&
+        wheel.at.x === at.x && wheel.at.y === at.y &&
+        Math.sign(wheel.deltaY) === Math.sign(deltaY) && Math.sign(wheel.deltaX) === Math.sign(deltaX) &&
+        Math.abs(wheel.deltaY + deltaY) <= 1200 && Math.abs(wheel.deltaX + deltaX) <= 1200) {
+      wheel.deltaY += deltaY; wheel.deltaX += deltaX;
+      return;
+    }
+    const blocks = Math.max(1, Math.ceil(Math.abs(deltaY) / 1200), Math.ceil(Math.abs(deltaX) / 1200));
+    // Admit the whole event before queuing any part. Never silently truncate
+    // a large delta or append its remainder behind a later key/attachment.
+    if (blocks > 128 - pending) {
+      wheel = undefined;
+      report(Promise.reject(new Error("窗口输入等待过多，请重新连接")));
+      return;
+    }
+    for (let block = 0; block < blocks; block++) {
+      const entry = { target, at, deltaY: clamp(deltaY), deltaX: clamp(deltaX) };
+      deltaY -= entry.deltaY; deltaX -= entry.deltaX;
+      report(run(() => {
+        if (wheel === entry) wheel = undefined;
+        if (!valid(entry.target)) throw new Error("输入窗口已变化，请重新操作");
+        return request("scroll", { ...entry.target, ...entry.at, delta: entry.deltaY, deltaX: entry.deltaX });
+      }));
+      wheel = entry;
+    }
   };
   on(element, "wheel", event => {
     if (!active() || !frame()) return;
