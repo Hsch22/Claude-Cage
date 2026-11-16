@@ -375,6 +375,7 @@ private func handle(_ input: Request, inputSession: MacWindowInputSession) async
             do {
                 var reply = try await canvas.capture(cached.0, filter:cached.1, layout:cached.2, after:input.after, wait:input.wait == true, binary:input.binary == true)
                 try consoleUser()
+                canvas.validatedInputTarget(cached.0, layout:cached.2, geometry:reply["geometry"] as? String)
                 reply["targetMs"] = 0; reply["layoutMs"] = 0; reply["cached"] = true
                 return reply
             } catch {
@@ -405,7 +406,7 @@ private func handle(_ input: Request, inputSession: MacWindowInputSession) async
             let layoutMs = (Date().timeIntervalSince(layoutStarted) * 1000).rounded()
             var reply = try await canvas.capture(target, filter:source, layout:layout, after:input.after, wait:input.wait == true, binary:input.binary == true)
             try consoleUser()
-            canvas.remember(target, filter:source, layout:layout, width:width, height:height, scale:scale)
+            canvas.remember(target, filter:source, layout:layout, width:width, height:height, scale:scale, geometry:reply["geometry"] as? String)
             reply["targetMs"] = targetMs; reply["layoutMs"] = layoutMs
             return reply
         }

@@ -156,6 +156,7 @@ final class ClaudeCanvasSession {
     private struct Target {
         let window: SCWindow, filter: SCContentFilter, layout: ClaudeCanvas
         let width: Int, height: Int, scale: Double, time: Date
+        var inputValidatedAt: Date
     }
     private var target: Target?
     private static let targetLifetime: TimeInterval = 2
@@ -170,8 +171,19 @@ final class ClaudeCanvasSession {
         return (cached.window, cached.filter, cached.layout)
     }
 
-    func remember(_ window: SCWindow, filter: SCContentFilter, layout: ClaudeCanvas, width: Int, height: Int, scale: Double) {
-        target = Target(window: window, filter: filter, layout: layout, width: width, height: height, scale: scale, time: Date())
+    func remember(_ window: SCWindow, filter: SCContentFilter, layout: ClaudeCanvas, width: Int, height: Int, scale: Double, geometry: String?) {
+        guard let geometry, token == geometry, last?.matches(layout) == true else { return }
+        let now = Date()
+        target = Target(window: window, filter: filter, layout: layout, width: width, height: height, scale: scale, time: now, inputValidatedAt: now)
+    }
+
+    // A fully validated frame refreshes input reuse, not the enumeration TTL.
+    // A request suspended during capture must not renew a replacement target.
+    func validatedInputTarget(_ window: SCWindow, layout: ClaudeCanvas, geometry: String?) {
+        guard let geometry, token == geometry, last?.matches(layout) == true,
+              var cached = target, cached.window === window, cached.layout.matches(layout) else { return }
+        cached.inputValidatedAt = Date()
+        target = cached
     }
 
     func forgetTarget() { target = nil }
@@ -180,7 +192,7 @@ final class ClaudeCanvasSession {
     // its captured bounds match the layout. Input checks geometry and focus
     // again before every delivery, including the SCWindow's original bounds.
     func cachedWindow() -> SCWindow? {
-        guard let cached = target, Date().timeIntervalSince(cached.time) < Self.targetLifetime,
+        guard let cached = target, Date().timeIntervalSince(cached.inputValidatedAt) < Self.targetLifetime,
               abs(cached.window.frame.minX - cached.layout.frame.minX) < 1,
               abs(cached.window.frame.minY - cached.layout.frame.minY) < 1,
               abs(cached.window.frame.width - cached.layout.frame.width) < 1,
