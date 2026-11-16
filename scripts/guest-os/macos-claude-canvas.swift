@@ -1,3 +1,90 @@
+import Foundation
+import CoreGraphics
+
+// Observe the result of an AX resize before publishing its crop as geometry.
+// A changed title-bar crop changes the required outer size; it must settle too.
+struct MacCanvasLayoutSettlement {
+    enum Decision: Equatable { case resize(CGSize), wait, settled }
+    enum Problem: Error { case unstable }
+    private var requested: CGSize
+    private var previous: (bounds: CGRect, crop: CGFloat)?
+    private var remaining = 12
+
+    init(requested: CGSize) { self.requested = requested }
+
+    mutating func observe(bounds: CGRect, crop: CGFloat, wanted: CGSize) throws -> Decision {
+        guard remaining > 0 else { throw Problem.unstable }
+        remaining -= 1
+        if wanted != requested {
+            requested = wanted
+            previous = nil
+            return .resize(wanted)
+        }
+        if let previous, previous.bounds == bounds, previous.crop == crop { return .settled }
+        previous = (bounds, crop)
+        return .wait
+    }
+}
+
+// Each fresh layout owns its asynchronous work and one successful crop check.
+// A superseded transaction cannot mutate the window or validate a newer cache.
+struct MacCanvasLayoutTransactions {
+    enum Problem: Error { case stale, cropChanged }
+    private(set) var current = UUID()
+    private var cropValidated = false
+
+    mutating func begin() -> UUID {
+        current = UUID()
+        cropValidated = false
+        return current
+    }
+    func isCurrent(_ generation: UUID) -> Bool { generation == current }
+    mutating func invalidate(_ generation: UUID) -> Bool {
+        guard isCurrent(generation) else { return false }
+        _ = begin()
+        return true
+    }
+    mutating func validateCrop(_ generation: UUID, probe: () -> Bool?) throws {
+        guard isCurrent(generation) else { throw Problem.stale }
+        if cropValidated { return }
+        // nil means background/unavailable AX, not successful validation.
+        guard let matches = probe() else { return }
+        guard matches else { throw Problem.cropChanged }
+        cropValidated = true
+    }
+}
+
+// Only a verified crop transition may retry unpublished frame preparation.
+// No input operation or generic window/identity failure enters this loop.
+struct MacCanvasCropChanged: Error {
+    let recoveryGeneration: UUID
+}
+
+@MainActor
+enum MacCanvasFrameConvergence {
+    enum Problem: Error { case unstable }
+    static func run<Output>(timeout: Duration = .seconds(8),
+                            attempt: (MacCanvasCropChanged?) async throws -> Output) async throws -> Output {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var recovery: MacCanvasCropChanged?
+        for _ in 0..<3 {
+            try Task.checkCancellation()
+            guard clock.now < deadline else { throw Problem.unstable }
+            do {
+                let result = try await attempt(recovery)
+                try Task.checkCancellation()
+                guard clock.now < deadline else { throw Problem.unstable }
+                return result
+            } catch let changed as MacCanvasCropChanged {
+                recovery = changed
+            }
+        }
+        throw Problem.unstable
+    }
+}
+
+#if !CAGE_CANVAS_LAYOUT_TEST
 // A geometry token describes only the signed Claude window actually captured.
 // All coordinates used for presentation and input are measured in guest points.
 import AppKit
@@ -6,6 +93,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 struct ClaudeCanvas {
+    let generation: UUID
     let id: CGWindowID
     let pid: pid_t
     let frame: CGRect
@@ -146,6 +234,7 @@ final class ClaudeCanvasSession {
         browser ? 0 : titleBarHeight(ax, rect)
     }
 
+    private var transactions = MacCanvasLayoutTransactions()
     private var last: ClaudeCanvas?
     private var token = ""
 
@@ -162,7 +251,7 @@ final class ClaudeCanvasSession {
     private static let targetLifetime: TimeInterval = 2
 
     func cachedTarget(width: Int, height: Int, scale: Double) -> (SCWindow, SCContentFilter, ClaudeCanvas)? {
-        guard let cached = target, cached.width == width, cached.height == height, cached.scale == scale,
+        guard let cached = target, transactions.isCurrent(cached.layout.generation), cached.width == width, cached.height == height, cached.scale == scale,
               Date().timeIntervalSince(cached.time) < Self.targetLifetime,
               (try? liveBounds(cached.layout.id, cached.layout.pid)) == cached.layout.frame else {
             target = nil
@@ -171,8 +260,16 @@ final class ClaudeCanvasSession {
         return (cached.window, cached.filter, cached.layout)
     }
 
+    func requirePublishedLayout(_ layout: ClaudeCanvas, geometry: String?) throws {
+        guard transactions.isCurrent(layout.generation), let geometry, token == geometry,
+              last?.matches(layout) == true else {
+            GuestDiagnostic.record("window", "capture_publication_superseded")
+            throw Failure(7, "window_changed")
+        }
+    }
+
     func remember(_ window: SCWindow, filter: SCContentFilter, layout: ClaudeCanvas, width: Int, height: Int, scale: Double, geometry: String?) {
-        guard let geometry, token == geometry, last?.matches(layout) == true else { return }
+        guard transactions.isCurrent(layout.generation), let geometry, token == geometry, last?.matches(layout) == true else { return }
         let now = Date()
         target = Target(window: window, filter: filter, layout: layout, width: width, height: height, scale: scale, time: now, inputValidatedAt: now)
     }
@@ -180,19 +277,30 @@ final class ClaudeCanvasSession {
     // A fully validated frame refreshes input reuse, not the enumeration TTL.
     // A request suspended during capture must not renew a replacement target.
     func validatedInputTarget(_ window: SCWindow, layout: ClaudeCanvas, geometry: String?) {
-        guard let geometry, token == geometry, last?.matches(layout) == true,
+        guard transactions.isCurrent(layout.generation), let geometry, token == geometry, last?.matches(layout) == true,
               var cached = target, cached.window === window, cached.layout.matches(layout) else { return }
         cached.inputValidatedAt = Date()
         target = cached
     }
 
-    func forgetTarget() { target = nil }
+    func forgetTarget(ifMatching layout: ClaudeCanvas) {
+        guard transactions.isCurrent(layout.generation), target?.layout.generation == layout.generation else { return }
+        target = nil
+    }
+
+    private func requireCurrentLayout(_ generation: UUID) throws {
+        guard transactions.isCurrent(generation) else { throw Failure(7, "window_changed") }
+    }
+
+    private func invalidateLayout(_ generation: UUID) {
+        if transactions.invalidate(generation) { measured = nil; target = nil }
+    }
 
     // Input reuses the window the frame stream already verified only while
     // its captured bounds match the layout. Input checks geometry and focus
     // again before every delivery, including the SCWindow's original bounds.
     func cachedWindow() -> SCWindow? {
-        guard let cached = target, Date().timeIntervalSince(cached.inputValidatedAt) < Self.targetLifetime,
+        guard let cached = target, transactions.isCurrent(cached.layout.generation), Date().timeIntervalSince(cached.inputValidatedAt) < Self.targetLifetime,
               abs(cached.window.frame.minX - cached.layout.frame.minX) < 1,
               abs(cached.window.frame.minY - cached.layout.frame.minY) < 1,
               abs(cached.window.frame.width - cached.layout.frame.width) < 1,
@@ -209,11 +317,15 @@ final class ClaudeCanvasSession {
         guard let pid = window.owningApplication?.processID,
               (320...2560).contains(width), (240...1600).contains(height),
               scale.isFinite, (1...2).contains(scale) else { throw Failure(8, "invalid_input") }
+        let generation = transactions.begin()
+        var completed = false
+        defer { if !completed { invalidateLayout(generation) } }
         var bounds = try liveBounds(window.windowID, pid)
         let density = min(max(1,CGFloat(filter.pointPixelScale)), CGFloat(scale))
         if let known = measured, known.id == window.windowID, known.pid == pid, known.bounds == bounds,
            known.width == width, known.height == height, Date().timeIntervalSince(known.time) < 1 {
-            return ClaudeCanvas(id: window.windowID, pid: pid, frame: bounds, cropTop: known.crop,
+            completed = true
+            return ClaudeCanvas(generation: generation, id: window.windowID, pid: pid, frame: bounds, cropTop: known.crop,
                                 scale: density, resizable: known.resized)
         }
         var crop: CGFloat = 0, resized = false
@@ -227,28 +339,63 @@ final class ClaudeCanvasSession {
                 let recent = requested.map { $0.id == window.windowID && $0.pid == pid && $0.size == wanted &&
                     $0.observed == bounds.size && Date().timeIntervalSince($0.time) < 3 } ?? false
                 if !close && !recent {
+                    try requireCurrentLayout(generation)
                     var size = wanted
                     if let value = AXValueCreate(.cgSize, &size),
                        AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, value) == .success {
-                        try await Task.sleep(nanoseconds: 70_000_000)
-                        bounds = try liveBounds(window.windowID, pid)
-                        // Position only an enlarged guest window that would extend off its display.
-                        var origin = CGPoint(x: max(display.minX, min(bounds.minX, display.maxX-bounds.width)),
-                                             y: max(display.minY, min(bounds.minY, display.maxY-bounds.height)))
-                        if origin != bounds.origin, canSet(ax, kAXPositionAttribute),
-                           let point = AXValueCreate(.cgPoint, &origin) {
-                            _ = AXUIElementSetAttributeValue(ax, kAXPositionAttribute as CFString, point)
+                        var settlement = MacCanvasLayoutSettlement(requested: wanted)
+                        settling: while true {
+                            try await Task.sleep(nanoseconds: 70_000_000)
+                            try requireCurrentLayout(generation)
+                            try consoleUser()
+                            guard try owns(pid) else { throw Failure(7, "window_changed") }
                             bounds = try liveBounds(window.windowID, pid)
+                            guard let current = owningAXWindow(pid, bounds), CFEqual(current, ax) else {
+                                throw Failure(7, "window_changed")
+                            }
+                            // Keep the same owned window on its display after resizing.
+                            var origin = CGPoint(x: max(display.minX, min(bounds.minX, display.maxX-bounds.width)),
+                                                 y: max(display.minY, min(bounds.minY, display.maxY-bounds.height)))
+                            if origin != bounds.origin, canSet(current, kAXPositionAttribute),
+                               let point = AXValueCreate(.cgPoint, &origin) {
+                                try requireCurrentLayout(generation)
+                                guard AXUIElementSetAttributeValue(current, kAXPositionAttribute as CFString, point) == .success else {
+                                    throw Failure(7, "window_changed")
+                                }
+                                bounds = try liveBounds(window.windowID, pid)
+                            }
+                            crop = cropHeight(current, bounds)
+                            let corrected = CGSize(width: min(CGFloat(width), display.width),
+                                                   height: min(CGFloat(height) + crop, display.height))
+                            let decision: MacCanvasLayoutSettlement.Decision
+                            do { decision = try settlement.observe(bounds: bounds, crop: crop, wanted: corrected) }
+                            catch { throw Failure(7, "window_changed") }
+                            switch decision {
+                            case .resize(var correctedSize):
+                                try requireCurrentLayout(generation)
+                                guard let value = AXValueCreate(.cgSize, &correctedSize),
+                                      AXUIElementSetAttributeValue(current, kAXSizeAttribute as CFString, value) == .success else {
+                                    throw Failure(7, "window_changed")
+                                }
+                            case .wait: continue
+                            case .settled: break settling
+                            }
                         }
                     }
-                    requested = (window.windowID, pid, wanted, bounds.size, Date())
+                    crop = cropHeight(ax, bounds)
+                    let finalWanted = CGSize(width: min(CGFloat(width), display.width),
+                                             height: min(CGFloat(height) + crop, display.height))
+                    requested = (window.windowID, pid, finalWanted, bounds.size, Date())
                 }
-                resized = abs(bounds.width-wanted.width) < 2 && abs(bounds.height-wanted.height) < 2
                 crop = cropHeight(ax, bounds)
+                let finalWanted = CGSize(width: min(CGFloat(width), display.width),
+                                         height: min(CGFloat(height) + crop, display.height))
+                resized = abs(bounds.width-finalWanted.width) < 2 && abs(bounds.height-finalWanted.height) < 2
             }
         }
         measured = (window.windowID, pid, bounds, width, height, crop, resized, Date())
-        return ClaudeCanvas(id: window.windowID, pid: pid, frame: bounds, cropTop: crop,
+        completed = true
+        return ClaudeCanvas(generation: generation, id: window.windowID, pid: pid, frame: bounds, cropTop: crop,
                             scale: density, resizable: resized)
     }
 
@@ -266,7 +413,40 @@ final class ClaudeCanvasSession {
         return last
     }
 
-    func capture(_ window: SCWindow, filter: SCContentFilter, layout: ClaudeCanvas, after: String? = nil, wait: Bool = false, binary: Bool = false, phoneJPEG: Bool = false) async throws -> [String:Any] {
+    func requireCropRecovery(_ changed: MacCanvasCropChanged, window: CGWindowID, pid: pid_t) throws {
+        try requireCurrentLayout(changed.recoveryGeneration)
+        try requireCropRecoveryTarget(window: window, pid: pid)
+    }
+
+    func requireCropRecoveryTarget(window: CGWindowID, pid: pid_t) throws {
+        try consoleUser()
+        guard try owns(pid), NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              owningAXWindow(pid, try liveBounds(window, pid)) != nil else {
+            GuestDiagnostic.record("window", "crop_recovery_target_changed")
+            throw Failure(7, "window_changed")
+        }
+    }
+
+    private func validateCurrentCrop(_ layout: ClaudeCanvas, allowRecovery: Bool) throws {
+        do {
+            try transactions.validateCrop(layout.generation) {
+                guard let ax = owningAXWindow(layout.pid, layout.frame) else { return nil }
+                return cropHeight(ax, layout.frame) == layout.cropTop
+            }
+        } catch MacCanvasLayoutTransactions.Problem.cropChanged {
+            invalidateLayout(layout.generation)
+            GuestDiagnostic.record("window", "capture_crop_changed")
+            if allowRecovery { throw MacCanvasCropChanged(recoveryGeneration: transactions.current) }
+            throw Failure(7, "window_changed")
+        } catch {
+            // A superseded capture must neither retry nor clear newer state.
+            GuestDiagnostic.record("window", "capture_layout_superseded")
+            throw Failure(7, "window_changed")
+        }
+    }
+
+    func capture(_ window: SCWindow, filter: SCContentFilter, layout: ClaudeCanvas, after: String? = nil, wait: Bool = false, binary: Bool = false, phoneJPEG: Bool = false, allowCropRecovery: Bool = false) async throws -> [String:Any] {
+        try requireCurrentLayout(layout.generation)
         let config = SCStreamConfiguration()
         config.width = max(1, Int((layout.frame.width*layout.scale).rounded()))
         config.height = max(1, Int((layout.frame.height*layout.scale).rounded()))
@@ -279,9 +459,13 @@ final class ClaudeCanvasSession {
         let captureStarted = Date()
         let (updated, sequence) = try await stream.frame(filter: filter, configuration: config, identity: geometry, after: after, wait: wait)
         let captureMs = Date().timeIntervalSince(captureStarted) * 1000
+        try requireCurrentLayout(layout.generation)
         guard try liveBounds(layout.id, layout.pid) == layout.frame,
               try owns(layout.pid) else { throw Failure(7, "window_changed") }
-        guard let image = updated else { return ["unchanged": true, "sequence": sequence, "geometry": geometry] }
+        guard let image = updated else {
+            try validateCurrentCrop(layout, allowRecovery: allowCropRecovery)
+            return ["unchanged": true, "sequence": sequence, "geometry": geometry]
+        }
         let top = Int((layout.cropTop * CGFloat(image.height) / layout.frame.height).rounded())
         guard top >= 0, top < image.height,
               let content = image.cropping(to: CGRect(x:0,y:top,width:image.width,height:image.height-top)) else {
@@ -292,9 +476,11 @@ final class ClaudeCanvasSession {
             try encodedWindowFrame(content, phoneJPEG: phoneJPEG)
         }.value
         let data = encoded.data, mime = encoded.mime
+        try requireCurrentLayout(layout.generation)
         // The second ownership check covers the time spent encoding.
         guard try liveBounds(layout.id, layout.pid) == layout.frame,
               try owns(layout.pid) else { throw Failure(7, "window_changed") }
+        try validateCurrentCrop(layout, allowRecovery: allowCropRecovery)
         var reply: [String:Any] = ["window":layout.id,"pid":layout.pid,"mime":mime,"sequence":sequence,
                 "contentWidth":layout.content.width,"contentHeight":layout.content.height,
                 "pixelWidth":content.width,"pixelHeight":content.height,"cropTop":layout.cropTop,
@@ -305,3 +491,5 @@ final class ClaudeCanvasSession {
         return reply
     }
 }
+
+#endif
