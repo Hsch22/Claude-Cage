@@ -1079,6 +1079,12 @@ func (s *Server) runSafetyCheck() (returned error) {
 	if err != nil {
 		return err
 	}
+	// Checking blocks guest DNS; discard negative answers cached during that
+	// interval only after the verified grant has reopened the network. A flush
+	// failure leaves granted false so the existing cleanup closes the gate.
+	if err = s.flushMacOSDNSAfterGrant(ctx); err != nil {
+		return err
+	}
 	granted = true
 	s.publishGate(state)
 	s.mu.Lock()

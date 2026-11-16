@@ -313,3 +313,34 @@ func (s *Server) checkMacOSNetwork() error {
 	}
 	return s.runSafetyCheck()
 }
+
+// flushMacOSDNSAfterGrant runs once after a verified checking-to-open grant,
+// never during ordinary lease renewal. It must not run before Grant: blocked
+// lookups could immediately recreate the negative entries being discarded.
+func (s *Server) flushMacOSDNSAfterGrant(ctx context.Context) error {
+	if s.macosGuest == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	user, err := guestos.MacOSProvisionUser(s.profile)
+	if err != nil {
+		return errors.New("macOS DNS 缓存刷新失败：安装账户尚未就绪")
+	}
+	base, err := guestos.MacOSSSHArgs(s.profile, user)
+	if err != nil {
+		return errors.New("macOS DNS 缓存刷新失败：安全 SSH 配置尚未就绪")
+	}
+	// Use the existing provisioning privilege boundary. Password input remains
+	// inside the guest; neither command output nor credentials enter diagnostics.
+	op := shellescape.QuoteCommand([]string{"/usr/bin/sudo", "-S", "-p", "", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/sh", "-ec", "/usr/bin/dscacheutil -flushcache\n/usr/bin/killall -HUP mDNSResponder"})
+	cmd := exec.CommandContext(ctx, sshExecutable(), append(base, "-T", s.sshTarget(), "--", "exec "+op+` < "$HOME/password"`)...)
+	cmd.Env = sshEnvironment()
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return errors.New("macOS DNS 缓存刷新超时或已取消，外网保持关闭")
+		}
+		return errors.New("macOS DNS 缓存刷新失败，外网保持关闭")
+	}
+	return nil
+}
